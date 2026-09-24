@@ -1,0 +1,9 @@
+# Block credential configuration files from ever entering Git
+.env.test
+.env.prod
+.env
+
+# Block python cache data
+__pycache__/
+*.pyc
+
