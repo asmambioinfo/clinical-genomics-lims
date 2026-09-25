@@ -1,0 +1,19 @@
+# .dockerignore
+#
+# Real credentials must never end up baked into an image layer -- excluded
+# here the same way they're excluded from git via .gitignore.
+.env.test
+.env.prod
+.env.local
+
+.git
+.gitignore
+__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+
+# The NGS pipeline is a completely separate execution context (Nextflow
+# manages its own per-tool containers) -- it has no business inside this
+# app image and would only bloat the build context.
+nextflow-run/

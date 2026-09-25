@@ -1,0 +1,68 @@
+name: CI/CD Production Deployment & Database Migration
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-and-migrate-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout Code from Git Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Test Suite (CI Quality Gate)
+        # No `|| true` here on purpose: a failing test must fail the job and
+        # block deployment, or this step isn't actually a gate.
+        run: python -m pytest _scripts/core/test_conn.py
+
+      - name: Apply Migrations to Test
+        env:
+          DB_SERVER: ${{ secrets.TEST_DB_SERVER }}
+          DB_DATABASE: ${{ secrets.TEST_DB_NAME }}
+          DB_USERNAME: ${{ secrets.TEST_DB_USER }}
+          DB_PASSWORD: ${{ secrets.TEST_DB_PASSWORD }}
+        run: python _scripts/run_migrations.py test
+
+  migrate-prod:
+    needs: test-and-migrate-test
+    runs-on: ubuntu-latest
+    # Requires the "production" environment to be configured in this repo's
+    # Settings > Environments with required reviewers -- that's what makes
+    # this step wait for manual approval before touching prod. Without that
+    # configuration, `environment:` here has no protective effect.
+    environment: production
+    steps:
+      - name: Checkout Code from Git Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python Environment
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Apply Migrations to Production
+        env:
+          DB_SERVER: ${{ secrets.PROD_DB_SERVER }}
+          DB_DATABASE: ${{ secrets.PROD_DB_NAME }}
+          DB_USERNAME: ${{ secrets.PROD_DB_USER }}
+          DB_PASSWORD: ${{ secrets.PROD_DB_PASSWORD }}
+        run: python _scripts/run_migrations.py prod

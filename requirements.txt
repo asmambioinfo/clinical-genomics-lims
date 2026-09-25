@@ -1,0 +1,21 @@
+# requirements.txt
+#
+# Python dependencies for frontend/app.py, _scripts/core/database.py, and
+# _scripts/run_migrations.py. Read by CI (.github/workflows/deploy.yml) and,
+# eventually, a Dockerfile for the app itself -- separate from the
+# per-tool bioinformatics containers already defined in
+# nextflow-run/nextflow.config, which don't use this file.
+#
+# Versions below are minimums, not exact pins. Once you've confirmed
+# everything works together locally, lock down exact versions with:
+#   pip freeze > requirements.txt
+# and commit that instead -- exact pins make CI and Docker builds
+# reproducible instead of silently picking up whatever's newest.
+
+streamlit>=1.38
+pymssql>=2.3
+python-dotenv>=1.0
+pytest>=8.0
+azure-identity>=1.17
+azure-keyvault-secrets>=4.8
+
