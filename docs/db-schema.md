@@ -1,21 +1,107 @@
 # Database Schema
 
-Source of truth for the schema is `db/schema.sql`. This document explains the
-design decisions behind it. If the two ever disagree, `schema.sql` wins —
-update this file to match.
+`db/schema.sql` is a reference snapshot: what a brand-new database should
+look like today. It is not run against a live database directly — `CREATE
+TABLE` fails outright if the table already exists, so it only works once,
+against something empty. The actual source of truth for changes over time is
+`db/migrations/`: small, numbered, one-way SQL files. `_scripts/run_migrations.py
+[test|prod]` applies whatever hasn't run yet on that instance and skips what
+has — it creates and manages a `migration_history` table automatically
+(tracked by filename, e.g. `0001_init.sql`), so migration files themselves
+don't need to self-track. To change the schema (add a table, add a column,
+whatever), add a new file in `db/migrations/` — copy the pattern in
+`0002_example_add_column.sql.txt` — never edit `0001_init.sql` or any
+already-applied migration after the fact. Periodically regenerate
+`schema.sql` from the current state of `migrations/` so the snapshot doesn't
+go stale, but treat that regeneration as documentation, not something you
+run.
+
+CI (`.github/workflows/deploy.yml`) runs `run_migrations.py prod` on every
+push to `main`. Before relying on this: confirm `DatabaseManager`'s
+connection either sets `autocommit=True` or that `get_cursor()` explicitly
+commits on a clean exit — `run_migrations.py` never calls `conn.commit()`
+itself, so if neither of those is true, migrations will report success
+without actually persisting.
 
 Engine: Azure SQL Server (confirmed via the connection in use —
 `iteragen.database.windows.net`, database `genomics_test`). Note:
 `nw.md` was originally drafted assuming Azure PostgreSQL; that's a mismatch
 worth resolving so networking docs match the actual engine.
 
+Test and production are two separate Azure SQL Database instances, not one
+shared database with a credential switch — `schema.sql` is applied
+identically to both (see the note at the top of that file), and
+`DatabaseManager` picks which instance to connect to based on environment
+(`.env.test` / `.env.prod`). This holds regardless of whether the prod
+instance is actually provisioned yet. Keeping the two identical is a process
+requirement, not something enforced by the SQL itself: always apply
+`schema.sql` to both instances the same way (e.g. via a small deploy script
+parameterized by environment) rather than hand-editing either one directly.
+
+The frontend currently talks to the database directly through
+`DatabaseManager`, with no API layer in between. An API layer is planned —
+not yet built — for when this needs to serve more than the one Streamlit
+app.
+
+`DatabaseManager`'s password lookup prefers Azure Key Vault over a plain
+`.env` value: if `KEY_VAULT_NAME` is set, it fetches `db-password-test` or
+`db-password-prod` (matching `env`) from that vault via
+`DefaultAzureCredential`, rather than reading `DB_PASSWORD` from
+`.env.<env>` directly. The `.env` value still works as a fallback when
+`KEY_VAULT_NAME` isn't set, so this doesn't break local setups that haven't
+migrated yet — but Key Vault is the intended path once this is more than a
+local prototype, since it means the real password never sits in a plaintext
+file on disk.
+
 ## Entity relationship
 
+```mermaid
+erDiagram
+  patients ||--o{ samples : "has"
+  samples ||--o{ orders : "has"
+  orders ||--o{ variants : "produces"
+  samples ||--o{ variants : "sample_id shortcut"
+  orders |o--o{ orders : "repeat_of"
+  patients {
+    varchar patient_id PK
+    varchar mrn UK
+    varchar name
+    int age
+    varchar sex
+    datetime date_registered
+  }
+  samples {
+    varchar sample_id PK
+    varchar patient_id FK
+    datetime date_collected
+  }
+  orders {
+    int order_id PK
+    varchar test_order_id UK "computed"
+    varchar sample_id FK
+    varchar test_code
+    int repeat_of_order_id FK
+    datetime date_ordered
+    varchar status
+  }
+  variants {
+    int variant_id PK
+    int order_id FK
+    varchar sample_id FK
+    varchar chrom
+    int start_pos
+    int end_pos
+    varchar ref
+    varchar alt
+    varbinary ref_alt_hash "computed"
+    varchar classification
+  }
 ```
-patients (1) ──< samples (1) ──< orders (1) ──< variants
-                                    │
-                                    └──(self-reference)── repeat_of_order_id
-```
+
+The chain runs MRN to patient, `patient_id` to samples, and `sample_id` to
+orders and variants. `patients` has no `sample_id` on purpose: one MRN can
+have many samples over time (different draws), so a single `sample_id` on the
+patient row could only hold one of them.
 
 - One patient (by `mrn`) can have many samples (different draws over time).
 - One sample can have many orders (different test codes, or the same
@@ -24,6 +110,15 @@ patients (1) ──< samples (1) ──< orders (1) ──< variants
 - An order can optionally point back at the order it's repeating
   (`repeat_of_order_id`), e.g. when a sequencing run fails and the same
   test is re-ordered against the same sample.
+
+Two links worth knowing about:
+
+- `variants` has two parents. It links to `orders` through `order_id` and to
+  `samples` through the `sample_id` shortcut. The pipeline uploader has to
+  copy `sample_id` from the parent order when it inserts variants, so the two
+  always match.
+- `orders` links to itself through `repeat_of_order_id`, which points back at
+  the order being repeated.
 
 ## `patients`
 
@@ -120,9 +215,12 @@ rather than a hard delete — not yet implemented.
 - **`test_code` is not constrained to a fixed set at the DB level** — only
   by the frontend's dropdown. A future migration should probably add a
   lookup table or `CHECK` constraint once the panel list stabilizes.
-- **No schema migration tooling yet.** Changes are currently applied by
-  hand-editing `schema.sql` and re-running against a fresh database. Worth
-  introducing versioned migrations before this touches production data.
+- **Order deletion is a soft-delete only** (`status = 'Deleted'` via the
+  frontend's delete button, not a hard `DELETE`). Undo, an audit trail of
+  who deleted what and when, and a confirmation modal before deleting are
+  intentionally out of scope for this demo — a production version would
+  need at least an audit log (who/when/previous status) before this
+  feature touches real patient data.
 
 ## Reset script
 
