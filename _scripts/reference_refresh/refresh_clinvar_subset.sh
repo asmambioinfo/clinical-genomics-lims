@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/refresh_clinvar_subset.sh
+# _scripts/reference_refresh/refresh_clinvar_subset.sh
 #
 # Refresh of the ClinVar subset used by main.nf's ANNOTATE step. Downloads
 # the current ClinVar VCF, subsets it to your gene panel, diffs it against
@@ -9,7 +9,7 @@
 # Otherwise it's left in a dated staging folder for human review.
 #
 # Unlike gnomAD, ClinVar has no numbered releases -- it's a single rolling
-# file, so "recent" is labeled by download date, not a version number.
+# file, so "recent" is labeled by the run's timestamp, not a version number.
 #
 # The pipeline-facing blob path never changes name (clinvar_current.vcf.gz)
 # -- same pattern as the gnomAD script. Version/date is tracked separately
@@ -29,8 +29,11 @@ TEST_VCF=""               # a known-good sample VCF for the E2E annotation check
 BLOB_ACCOUNT="genomicsngs"
 BLOB_CONTAINER="reference-data"
 BLOB_PREFIX="reference"
-DATESTAMP=$(date +%Y%m%d)
-WORKDIR="./clinvar_refresh_${DATESTAMP}_$(date +%H%M%S)"
+# One timestamp for the whole run, used in every name the run produces
+# (staging folder, version label, archive folder, report), so two runs can
+# never overwrite each other's output, even on the same day.
+RUNSTAMP=$(date +%y%m%d_%H%M%S)
+WORKDIR="./clinvar_refresh_${RUNSTAMP}"
 
 usage() {
     echo "Usage: $0 --gene-bed FILE [--test-vcf FILE] [--threshold PCT]"
@@ -60,15 +63,15 @@ echo "Working directory: $(pwd)"
 STORAGE_KEY="$(az keyvault secret show --vault-name genomics-secrets --name storage-account-key --query value -o tsv)"
 
 # ---------- 1. download the current ClinVar release ----------
-mkdir -p "recent_${DATESTAMP}_to_test"
+mkdir -p "recent_${RUNSTAMP}_to_test"
 echo "Downloading current ClinVar release..."
 curl -sO https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz
 curl -sO https://ftp.ncbi.nlm.nih.gov/pub/clinvar/vcf_GRCh38/clinvar.vcf.gz.tbi
 
 # ---------- 2. subset to the gene panel ----------
 echo "Subsetting to gene panel regions..."
-bcftools view -R "$GENE_BED" clinvar.vcf.gz -Oz -o "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz"
-tabix -p vcf "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz"
+bcftools view -R "$GENE_BED" clinvar.vcf.gz -Oz -o "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz"
+tabix -p vcf "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz"
 
 # ---------- 3. pull the current subset from blob for comparison ----------
 mkdir -p current
@@ -99,9 +102,9 @@ mkdir -p report
 
 if [[ "$CURRENT_EXISTS" == "0" ]]; then
     echo "No current ClinVar subset found in blob -- treating everything as added (first run)."
-    ADDED=$(bcftools view -H "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz" | wc -l | tr -d ' ')
+    ADDED=$(bcftools view -H "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz" | wc -l | tr -d ' ')
 else
-    bcftools isec -p isec_out -O z current/clinvar_current.vcf.gz "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz" >/dev/null
+    bcftools isec -p isec_out -O z current/clinvar_current.vcf.gz "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz" >/dev/null
 
     ADDED=$(zcat isec_out/0001.vcf.gz | grep -vc '^#' || true)
     DELETED=$(zcat isec_out/0000.vcf.gz | grep -vc '^#' || true)
@@ -128,7 +131,7 @@ fi
 echo "# ClinVar subset refresh report"
 echo ""
 echo "Current version: $CURRENT_VERSION"
-echo "New version (download date): $DATESTAMP"
+echo "New version (run timestamp): $RUNSTAMP"
 echo "Generated: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo ""
 echo "## Diff (position + CLNSIG)"
@@ -146,7 +149,7 @@ echo "- Threshold: ${THRESHOLD_PCT}%"
 E2E_PASSED=1
 if [[ -n "$TEST_VCF" ]]; then
     echo "Running E2E annotation check against $TEST_VCF..."
-    if bcftools annotate -a "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz" \
+    if bcftools annotate -a "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz" \
         -c INFO/CLNSIG,INFO/CLNDN -O z -o report/e2e_test_output.vcf.gz "$TEST_VCF" 2>report/e2e_error.log; then
         ANNOTATED_COUNT=$(bcftools view -H report/e2e_test_output.vcf.gz | grep -c 'CLNSIG' || true)
         echo "E2E check passed: annotation ran without error, $ANNOTATED_COUNT records annotated." | tee -a report/summary.md
@@ -168,39 +171,72 @@ echo ""
 # ---------- 6. pass/fail decision ----------
 DIFF_PASSED=$(awk -v pct="$PCT_CHANGE" -v thresh="$THRESHOLD_PCT" 'BEGIN{print (pct<thresh) ? "1" : "0"}')
 
+# Reports are never overwritten: every run has its own timestamped name, and
+# the upload fails rather than replace a report that somehow already exists.
+# Failed runs are uploaded too, since that is when someone most needs the
+# report, and a scheduled cloud run's local files vanish when it exits.
+upload_report() {
+    local result=$1
+    echo "- Result: ${result}" >> report/summary.md
+    az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
+        -c "$BLOB_CONTAINER" -f report/summary.md \
+        -n "${BLOB_PREFIX}/reports/clinvar_refresh_${RUNSTAMP}_${result}.md" --overwrite false
+}
+
+# The archive copy runs on Azure's side and can finish after the command
+# returns, so wait for it to report success before current is overwritten.
+wait_for_copy() {
+    local blob=$1 status=""
+    for _ in $(seq 1 60); do
+        status=$(az storage blob show --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
+            -c "$BLOB_CONTAINER" -n "$blob" --query properties.copy.status -o tsv)
+        [[ "$status" == "success" ]] && return 0
+        [[ "$status" == "failed" || "$status" == "aborted" ]] && break
+        sleep 2
+    done
+    echo "Archive copy did not finish (status: ${status:-unknown}). Stopping before current is overwritten." >&2
+    return 1
+}
+
 if [[ "$DIFF_PASSED" == "1" && "$E2E_PASSED" == "1" ]]; then
     echo "PASSED: diff ${PCT_CHANGE}% < ${THRESHOLD_PCT}% threshold, E2E check ok (or skipped)."
     echo "Archiving current and promoting new version."
 
     if [[ "$CURRENT_VERSION" != "unknown" ]]; then
+        ARCHIVE_BLOB="${BLOB_PREFIX}/archive_clinvar_${CURRENT_VERSION}/clinvar_${CURRENT_VERSION}.vcf.gz"
         az storage blob copy start --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
             --destination-container "$BLOB_CONTAINER" \
-            --destination-blob "${BLOB_PREFIX}/archive_clinvar_${CURRENT_VERSION}/clinvar_${CURRENT_VERSION}.vcf.gz" \
+            --destination-blob "$ARCHIVE_BLOB" \
             --source-container "$BLOB_CONTAINER" \
             --source-blob "${BLOB_PREFIX}/clinvar_current.vcf.gz"
+        wait_for_copy "$ARCHIVE_BLOB" || {
+            echo "- Archive copy failed. current was not changed." >> report/summary.md
+            upload_report failed
+            exit 1
+        }
         echo "Archived previous version ($CURRENT_VERSION) to archive_clinvar_${CURRENT_VERSION}/"
     fi
 
+    # Promote: the stable "current" names are meant to be overwritten. The
+    # old content was archived above before this point.
     az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
-        -c "$BLOB_CONTAINER" -f "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz" \
+        -c "$BLOB_CONTAINER" -f "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz" \
         -n "${BLOB_PREFIX}/clinvar_current.vcf.gz" --overwrite
     az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
-        -c "$BLOB_CONTAINER" -f "recent_${DATESTAMP}_to_test/clinvar_subset.vcf.gz.tbi" \
+        -c "$BLOB_CONTAINER" -f "recent_${RUNSTAMP}_to_test/clinvar_subset.vcf.gz.tbi" \
         -n "${BLOB_PREFIX}/clinvar_current.vcf.gz.tbi" --overwrite
-    echo "$DATESTAMP" > current_version.txt
+    echo "$RUNSTAMP" > current_version.txt
     az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
         -c "$BLOB_CONTAINER" -f current_version.txt -n "${BLOB_PREFIX}/clinvar_current_version.txt" --overwrite
 
-    az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
-        -c "$BLOB_CONTAINER" -f report/summary.md \
-        -n "${BLOB_PREFIX}/reports/clinvar_refresh_${DATESTAMP}.md" --overwrite
-
-    echo "Done. clinvar_current.vcf.gz now holds the $DATESTAMP release."
+    upload_report passed
+    echo "Done. clinvar_current.vcf.gz now holds the $RUNSTAMP release."
 else
     echo "FAILED."
     [[ "$DIFF_PASSED" == "0" ]] && echo "  - Diff ${PCT_CHANGE}% >= ${THRESHOLD_PCT}% threshold -- needs human review."
     [[ "$E2E_PASSED" == "0" ]] && echo "  - E2E annotation check failed -- see report/e2e_error.log."
-    echo "current/ is untouched. recent_${DATESTAMP}_to_test/ and report/ are"
+    upload_report failed
+    echo "current/ is untouched. recent_${RUNSTAMP}_to_test/ and report/ are"
     echo "left in $(pwd) for review. Nothing was archived or promoted."
     exit 1
 fi

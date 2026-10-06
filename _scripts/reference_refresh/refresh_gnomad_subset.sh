@@ -1,5 +1,5 @@
 #!/bin/bash
-# scripts/refresh_gnomad_subset.sh
+# _scripts/reference_refresh/refresh_gnomad_subset.sh
 #
 # Quarterly refresh of the gnomAD subset used by main.nf's ANNOTATE step.
 # Downloads the latest gnomAD exomes release (or a version you specify),
@@ -27,7 +27,10 @@ BLOB_ACCOUNT="genomicsngs"
 BLOB_CONTAINER="reference-data"
 BLOB_PREFIX="reference"
 AF_EPSILON="0.000001"     # ignore AF differences smaller than this (float noise)
-WORKDIR="./gnomad_refresh_$(date +%Y%m%d_%H%M%S)"
+# One timestamp for the whole run, used in the names it produces (archive
+# folder, report), so two runs can never overwrite each other's output.
+RUNSTAMP=$(date +%y%m%d_%H%M%S)
+WORKDIR="./gnomad_refresh_${RUNSTAMP}"
 
 usage() {
     echo "Usage: $0 --gene-bed FILE [--version X.Y[.Z]] [--threshold PCT]"
@@ -216,22 +219,56 @@ echo ""
 # ---------- 6. pass/fail decision ----------
 PASSED=$(awk -v pct="$PCT_CHANGE" -v thresh="$THRESHOLD_PCT" 'BEGIN{print (pct<thresh) ? "1" : "0"}')
 
+# Reports are never overwritten: every run has its own timestamped name, and
+# the upload fails rather than replace a report that somehow already exists.
+# Failed runs are uploaded too, since that is when someone most needs the
+# report, and a scheduled cloud run's local files vanish when it exits.
+upload_report() {
+    local result=$1
+    echo "- Result: ${result}" >> report/summary.md
+    az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
+        -c "$BLOB_CONTAINER" -f report/summary.md \
+        -n "${BLOB_PREFIX}/reports/gnomad_refresh_${VERSION}_${RUNSTAMP}_${result}.md" --overwrite false
+}
+
+# The archive copy runs on Azure's side and can finish after the command
+# returns, so wait for it to report success before current is overwritten.
+wait_for_copy() {
+    local blob=$1 status=""
+    for _ in $(seq 1 60); do
+        status=$(az storage blob show --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
+            -c "$BLOB_CONTAINER" -n "$blob" --query properties.copy.status -o tsv)
+        [[ "$status" == "success" ]] && return 0
+        [[ "$status" == "failed" || "$status" == "aborted" ]] && break
+        sleep 2
+    done
+    echo "Archive copy did not finish (status: ${status:-unknown}). Stopping before current is overwritten." >&2
+    return 1
+}
+
 if [[ "$PASSED" == "1" ]]; then
     echo "PASSED: ${PCT_CHANGE}% < ${THRESHOLD_PCT}% threshold. Archiving current and promoting new version."
 
-    # Archive the current version under its own version-labeled folder,
-    # but only now, having confirmed the new one is good -- never before.
+    # Archive the current version under its own folder, but only now, having
+    # confirmed the new one is good -- never before. The folder name carries
+    # this run's timestamp, so re-promoting the same release can't collide.
     if [[ "$CURRENT_VERSION" != "unknown" ]]; then
+        ARCHIVE_BLOB="${BLOB_PREFIX}/archive_v${CURRENT_VERSION}_${RUNSTAMP}/gnomad_v${CURRENT_VERSION}.vcf.gz"
         az storage blob copy start --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
             --destination-container "$BLOB_CONTAINER" \
-            --destination-blob "${BLOB_PREFIX}/archive_v${CURRENT_VERSION}/gnomad_v${CURRENT_VERSION}.vcf.gz" \
+            --destination-blob "$ARCHIVE_BLOB" \
             --source-container "$BLOB_CONTAINER" \
             --source-blob "${BLOB_PREFIX}/gnomad_current.vcf.gz"
-        echo "Archived previous version ($CURRENT_VERSION) to archive_v${CURRENT_VERSION}/"
+        wait_for_copy "$ARCHIVE_BLOB" || {
+            echo "- Archive copy failed. current was not changed." >> report/summary.md
+            upload_report failed
+            exit 1
+        }
+        echo "Archived previous version ($CURRENT_VERSION) to archive_v${CURRENT_VERSION}_${RUNSTAMP}/"
     fi
 
-    # Promote: the stable "current" name gets overwritten with the new
-    # content. nextflow.config's --gnomad_vcf path never changes.
+    # Promote: the stable "current" names are meant to be overwritten.
+    # nextflow.config's --gnomad_vcf path never changes.
     az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
         -c "$BLOB_CONTAINER" -f "recent_v${VERSION}_to_test/gnomad_subset.vcf.gz" \
         -n "${BLOB_PREFIX}/gnomad_current.vcf.gz" --overwrite
@@ -242,14 +279,12 @@ if [[ "$PASSED" == "1" ]]; then
     az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
         -c "$BLOB_CONTAINER" -f current_version.txt -n "${BLOB_PREFIX}/current_version.txt" --overwrite
 
-    az storage blob upload --account-name "$BLOB_ACCOUNT" --auth-mode key --account-key "$STORAGE_KEY" \
-        -c "$BLOB_CONTAINER" -f report/summary.md \
-        -n "${BLOB_PREFIX}/reports/gnomad_refresh_${VERSION}_$(date +%Y%m%d).md" --overwrite
-
+    upload_report passed
     echo "Done. gnomad_current.vcf.gz now holds version $VERSION."
 else
     echo "FAILED: ${PCT_CHANGE}% >= ${THRESHOLD_PCT}% threshold."
     echo "Change is larger than expected -- this needs human review before promoting."
+    upload_report failed
     echo "current/ is untouched. recent_v${VERSION}_to_test/ and report/summary.md are"
     echo "left in $(pwd) for review. Nothing was archived or promoted."
     exit 1
