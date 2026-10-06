@@ -160,7 +160,7 @@ has an explicit index for join performance).
 | `test_code` | `VARCHAR(50)` NOT NULL | e.g. `Hereditary_Cancer`, `Cardio_Risk`, `Whole_Exome`. Currently free text in the frontend dropdown — not DB-constrained to a fixed list. |
 | `repeat_of_order_id` | `INT` NULL FK → `orders.order_id` (self) | Set when this order repeats a prior one on the same sample (e.g. failed sequencing run, re-run on the same extracted material). NULL for a first attempt. |
 | `date_ordered` | `DATETIME` DEFAULT `GETDATE()` | |
-| `status` | `VARCHAR(20)` DEFAULT `'Pending'`, `CHECK IN ('Pending','Running','Completed','Failed','Cancelled')` | |
+| `status` | `VARCHAR(20)` DEFAULT `'Pending'`, `CHECK IN ('Pending','Running','Completed','Failed','Cancelled','Deleted')` | `Deleted` was added by migration `0002_add_deleted_status.sql` and is what the soft-delete action sets. |
 
 Indexes: `idx_orders_sample_id`, `idx_orders_repeat_of`.
 
@@ -203,6 +203,11 @@ state-level rules commonly require multi-year retention), so an accidental
 delete should fail loudly, not quietly wipe downstream records. If records
 genuinely need to be retired, use a soft-delete flag (e.g. `is_active`)
 rather than a hard delete — not yet implemented.
+
+Schema changes follow a stricter rule than this: migrations never drop a
+table or column and never insert, update or delete rows. Retired columns and
+tables are renamed with an `_archive` suffix instead. The full policy is in
+`db/migrations/README.md`.
 
 ## Known limitations / open items
 

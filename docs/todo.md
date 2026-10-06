@@ -73,3 +73,16 @@ structural variant tier would be a separate addition on top of that,
 built on gnomAD's SV dataset (`release/4.1/genome_sv/`) rather than an
 extension of the joint tier — different data, different analysis, not
 just "more of the same."
+
+## Data integrity
+
+- Audit trail columns on patients, samples, orders and variants (created and
+  modified timestamp and user, plus a record status for soft delete). This
+  is best done while the tables are still small, since the migration policy
+  in `db/migrations/README.md` rules out backfilling existing rows.
+- Enforce the migration policy in `_scripts/run_migrations.py`: refuse any
+  migration containing DROP TABLE, DROP COLUMN, TRUNCATE, INSERT, UPDATE or
+  DELETE unless it falls under one of the documented exceptions. Today the
+  policy is written down but not enforced.
+- Later hardening: block table and column drops at the database level with a
+  DDL trigger, and give the migration login no data-write permissions.
