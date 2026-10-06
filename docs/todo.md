@@ -7,15 +7,27 @@ wrong with what exists.
 
 ## Reference database maintenance
 
-- gnomAD quarterly refresh is built: `scripts/refresh_gnomad_subset.sh`
+- gnomAD quarterly refresh is built: `_scripts/reference_refresh/refresh_gnomad_subset.sh`
   (auto-detects latest release, subsets to the gene panel, diffs
   chr-by-chr against current, archives + promotes only if under
   threshold). See `workflows.md` workflow 7 for the two things it still
   needs before it can run unattended (blob account/container
   confirmation, Key Vault role for a non-human identity).
-- ClinVar quarterly refresh: not built yet. Same shape as the gnomAD
-  script, but diffs on `CLNSIG` (clinical significance) instead of `AF`,
-  since that's ClinVar's field.
+- ClinVar quarterly refresh is built too: `_scripts/reference_refresh/refresh_clinvar_subset.sh`.
+  Same shape as the gnomAD script, but diffs on `CLNSIG` (clinical
+  significance) instead of `AF`, since that's ClinVar's field, and adds
+  an E2E annotation check (`--test-vcf`) before promoting -- skipped with
+  a warning if no test VCF is given yet.
+
+**Where these actually run, long-term:** not a laptop. The plan is a
+dedicated Docker image for the refresh scripts (bcftools, tabix, bedtools,
+curl, az CLI all baked in -- separate from both the app's `Dockerfile` and
+Nextflow's per-tool containers, since this image's job is neither of
+those), run on a schedule rather than by hand -- either a GitHub Actions
+workflow with a cron trigger (same pattern as `deploy.yml`, time-based
+instead of push-based), or an Azure Container Instance kicked off by Azure
+Automation/Logic Apps on a schedule. Not built yet; today these scripts
+still assume a machine with the tools already installed locally.
 
 ## EHR / LIMS integration
 
@@ -52,3 +64,12 @@ blob storage some other way in the meantime. Two options, neither built:
 Either way, once a FASTQ lands in blob storage, the sequencer-trigger
 mechanism above is what would actually kick off `main.nf` — these two
 pieces are meant to work together, not as separate features.
+
+## Reference tier expansion
+
+Already covered in `iteragen.md`'s pricing tiers section: exome now,
+genome/joint as future paid tiers for regular SNV/indel analysis. A
+structural variant tier would be a separate addition on top of that,
+built on gnomAD's SV dataset (`release/4.1/genome_sv/`) rather than an
+extension of the joint tier — different data, different analysis, not
+just "more of the same."
