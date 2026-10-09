@@ -86,3 +86,13 @@ just "more of the same."
   policy is written down but not enforced.
 - Later hardening: block table and column drops at the database level with a
   DDL trigger, and give the migration login no data-write permissions.
+
+## Repository structure
+
+- Split this repo into a LIMS repo (frontend and database) and a pipeline
+  repo (`nextflow-run/`, `_scripts/reference_refresh/`, `tests/variants/`)
+  once the results uploader and the API layer exist. The API is the
+  boundary: the pipeline would send results to the API instead of
+  connecting to the database directly. The history can be kept through the
+  split with `git filter-repo`. Until then it stays one repo, for the
+  reasons in the "Repository layout" section of the README.
